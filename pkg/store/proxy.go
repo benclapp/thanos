@@ -94,51 +94,64 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 	}
 
 	var (
-		seriesSet []storepb.SeriesSet
-		respCh    = make(chan *storepb.SeriesResponse, len(stores)+1)
-		g, gctx   = errgroup.WithContext(srv.Context())
+		// Allow to buffer max 10 series response.
+		// Each might be quite large (multi chunk long series given by sidecar).
+		respCh  = make(chan *storepb.SeriesResponse, 10)
+		g, gctx = errgroup.WithContext(srv.Context())
 	)
 
-	var storeDebugMsgs []string
-
-	for _, st := range stores {
-		// We might be able to skip the store if its meta information indicates
-		// it cannot have series matching our query.
-		// NOTE: all matchers are validated in labelsMatches method so we explicitly ignore error.
-		if ok, _ := storeMatches(st, r.MinTime, r.MaxTime, newMatchers...); !ok {
-			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s filtered out", st))
-			continue
-		}
-		storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s queried", st))
-
-		sc, err := st.Series(gctx, &storepb.SeriesRequest{
-			MinTime:                 r.MinTime,
-			MaxTime:                 r.MaxTime,
-			Matchers:                newMatchers,
-			Aggregates:              r.Aggregates,
-			MaxResolutionWindow:     r.MaxResolutionWindow,
-			PartialResponseDisabled: r.PartialResponseDisabled,
-		})
-		if err != nil {
-			storeID := fmt.Sprintf("%v", storepb.LabelsToString(st.Labels()))
-			if storeID == "" {
-				storeID = "Store Gateway"
-			}
-			err = errors.Wrapf(err, "fetch series for %s %s", storeID, st)
-			if r.PartialResponseDisabled {
-				level.Error(s.logger).Log("err", err, "msg", "partial response disabled; aborting request")
-				return err
-			}
-			respCh <- storepb.NewWarnSeriesResponse(err)
-			continue
-		}
-
-		seriesSet = append(seriesSet, startStreamSeriesSet(sc, respCh, 10))
-	}
-
-	level.Debug(s.logger).Log("msg", strings.Join(storeDebugMsgs, ";"))
+	recvCtx, recvCancel := context.WithCancel(gctx)
 	g.Go(func() error {
-		defer close(respCh)
+		var (
+			seriesSet      []storepb.SeriesSet
+			storeDebugMsgs []string
+			r              = &storepb.SeriesRequest{
+				MinTime:                 r.MinTime,
+				MaxTime:                 r.MaxTime,
+				Matchers:                newMatchers,
+				Aggregates:              r.Aggregates,
+				MaxResolutionWindow:     r.MaxResolutionWindow,
+				PartialResponseDisabled: r.PartialResponseDisabled,
+			}
+			wg = &sync.WaitGroup{}
+		)
+
+		defer func() {
+			recvCancel()
+			wg.Wait()
+			close(respCh)
+		}()
+
+		for _, st := range stores {
+			// We might be able to skip the store if its meta information indicates
+			// it cannot have series matching our query.
+			// NOTE: all matchers are validated in labelsMatches method so we explicitly ignore error.
+			if ok, _ := storeMatches(st, r.MinTime, r.MaxTime, r.Matchers...); !ok {
+				storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s filtered out", st))
+				continue
+			}
+			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s queried", st))
+
+			sc, err := st.Series(recvCtx, r)
+			if err != nil {
+				storeID := fmt.Sprintf("%v", storepb.LabelsToString(st.Labels()))
+				if storeID == "" {
+					storeID = "Store Gateway"
+				}
+				err = errors.Wrapf(err, "fetch series for %s %s", storeID, st)
+				if r.PartialResponseDisabled {
+					level.Error(s.logger).Log("err", err, "msg", "partial response disabled; aborting request")
+					return err
+				}
+				respCh <- storepb.NewWarnSeriesResponse(err)
+				continue
+			}
+
+			// Schedule streamSeriesSet that translates gRPC streamed response into seriesSet (if series) or respCh if warnings.
+			seriesSet = append(seriesSet, startStreamSeriesSet(recvCtx, wg, sc, respCh, st.String(), !r.PartialResponseDisabled))
+		}
+
+		level.Debug(s.logger).Log("msg", strings.Join(storeDebugMsgs, ";"))
 
 		if len(seriesSet) == 0 {
 			// This is indicates that configured StoreAPIs are not the ones end user expects
@@ -159,6 +172,8 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 
 	for resp := range respCh {
 		if err := srv.Send(resp); err != nil {
+			recvCancel()
+			for range respCh {}
 			return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 		}
 	}
@@ -179,40 +194,61 @@ type streamSeriesSet struct {
 
 	currSeries *storepb.Series
 	recvCh     chan *storepb.Series
+
+	errMtx sync.Mutex
+	err error
+
+	name string
 }
 
 func startStreamSeriesSet(
+	ctx context.Context,
+	wg *sync.WaitGroup,
 	stream storepb.Store_SeriesClient,
 	warnCh chan<- *storepb.SeriesResponse,
-	bufferSize int,
+	name string,
+	partialResponse bool,
 ) *streamSeriesSet {
 	s := &streamSeriesSet{
 		stream: stream,
 		warnCh: warnCh,
-		recvCh: make(chan *storepb.Series, bufferSize),
+		recvCh: make(chan *storepb.Series, 10),
+		name: name,
 	}
-	go s.fetchLoop()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(s.recvCh)
+		for {
+			r, err := s.stream.Recv()
+			if err == io.EOF {
+				return
+			}
+
+			if err != nil {
+				if partialResponse {
+					s.warnCh <- storepb.NewWarnSeriesResponse(errors.Wrap(err, "receive series"))
+					return
+				}
+				if ctx.Err() != nil {
+					return
+				}
+
+				s.errMtx.Lock()
+				defer s.errMtx.Unlock()
+				s.err = err
+				return
+			}
+
+			if w := r.GetWarning(); w != "" {
+				s.warnCh <- storepb.NewWarnSeriesResponse(errors.New(w))
+				continue
+			}
+			s.recvCh <- r.GetSeries()
+		}
+	}()
 	return s
-}
-
-func (s *streamSeriesSet) fetchLoop() {
-	defer close(s.recvCh)
-	for {
-		r, err := s.stream.Recv()
-		if err == io.EOF {
-			return
-		}
-		if err != nil {
-			s.warnCh <- storepb.NewWarnSeriesResponse(errors.Wrap(err, "receive series"))
-			return
-		}
-
-		if w := r.GetWarning(); w != "" {
-			s.warnCh <- storepb.NewWarnSeriesResponse(errors.New(w))
-			continue
-		}
-		s.recvCh <- r.GetSeries()
-	}
 }
 
 // Next blocks until new message is received or stream is closed.
@@ -228,7 +264,9 @@ func (s *streamSeriesSet) At() ([]storepb.Label, []storepb.AggrChunk) {
 	return s.currSeries.Labels, s.currSeries.Chunks
 }
 func (s *streamSeriesSet) Err() error {
-	return nil
+	s.errMtx.Lock()
+	defer s.errMtx.Unlock()
+	return errors.Wrap(s.err, s.name)
 }
 
 // matchStore returns true if the given store may hold data for the given label matchers.
